@@ -29,7 +29,7 @@ const App: React.FC = () => {
   }, []);
 
   const resetAll = () => {
-    if (confirm('Bạn có chắc chắn muốn xóa toàn bộ dữ liệu hiện tại?')) {
+    if (confirm('Xóa toàn bộ dữ liệu để nạp file mới?')) {
       setSubtitles([]);
       setLogs([]);
       setAutoGlossary([]);
@@ -37,7 +37,7 @@ const App: React.FC = () => {
       setIsTranslating(false);
       fullContentRef.current = "";
       if (fileInputRef.current) fileInputRef.current.value = "";
-      log('Hệ thống đã được làm mới.', 'info');
+      log('Hệ thống đã làm mới.', 'info');
     }
   };
 
@@ -54,13 +54,15 @@ const App: React.FC = () => {
       log(`Đã nạp file: ${file.name} (${blocks.length} dòng)`, 'success');
 
       setIsScanning(true);
-      log('Đang quét thuật ngữ tự động...', 'info');
+      setAutoGlossary([]);
       try {
         const terms = await scanGlossary(content, style);
-        setAutoGlossary(terms);
-        log(`Tìm thấy ${terms.length} thuật ngữ quan trọng.`, 'success');
+        if (terms && terms.length > 0) {
+          setAutoGlossary(terms);
+          log(`Đã trích xuất ${terms.length} thuật ngữ.`, 'success');
+        }
       } catch (err) {
-        log(`Không thể quét thuật ngữ tự động.`, 'error');
+        log(`Lỗi quét thuật ngữ.`, 'error');
       } finally {
         setIsScanning(false);
       }
@@ -88,7 +90,6 @@ const App: React.FC = () => {
   const translateSingleLine = async (index: number) => {
     if (isTranslating) return;
     const sub = subtitles[index];
-    
     setSubtitles(prev => {
       const next = [...prev];
       next[index] = { ...next[index], status: 'processing' };
@@ -96,33 +97,19 @@ const App: React.FC = () => {
     });
 
     try {
-      const results = await translateBatch(
-        [sub.text],
-        targetLang,
-        style,
-        model,
-        "",
-        fullContentRef.current,
-        autoGlossary
-      );
-
+      const results = await translateBatch([sub.text], targetLang, style, model, "", "", autoGlossary);
       setSubtitles(prev => {
         const next = [...prev];
-        next[index] = { 
-          ...next[index], 
-          translatedText: results[0] || "Lỗi", 
-          status: results[0] ? 'done' : 'error' 
-        };
+        next[index] = { ...next[index], translatedText: results[0], status: 'done' };
         return next;
       });
-      log(`Đã dịch lại dòng #${sub.id}`, 'success');
     } catch (err) {
-      log(`Lỗi khi dịch lại dòng #${sub.id}`, 'error');
       setSubtitles(prev => {
         const next = [...prev];
         next[index] = { ...next[index], status: 'error' };
         return next;
       });
+      log(`Không thể dịch dòng #${sub.id} sau nhiều lần thử.`, 'error');
     }
   };
 
@@ -130,24 +117,25 @@ const App: React.FC = () => {
     if (subtitles.length === 0 || isTranslating) return;
     setIsTranslating(true);
     isStoppingRef.current = false;
-    log(`Bắt đầu dịch sang ${targetLang} (Tổng Hợp: ${style})...`, 'info');
+    log(`Bắt đầu dịch toàn bộ ${subtitles.length} dòng...`, 'info');
     
-    // Sử dụng batching thông minh để xử lý vô hạn dòng mà không làm treo UI
-    const totalLines = subtitles.length;
-    
-    for (let i = 0; i < totalLines; i += batchSize) {
+    let i = 0;
+    while (i < subtitles.length) {
       if (isStoppingRef.current) break;
       
-      const end = Math.min(i + batchSize, totalLines);
+      const end = Math.min(i + batchSize, subtitles.length);
       const batchIndices = Array.from({ length: end - i }, (_, k) => i + k);
       const textsToTranslate = batchIndices.map(idx => subtitles[idx].text);
       
-      log(`Đang xử lý block ${Math.floor(i/batchSize) + 1} - ${totalLines}...`, 'info');
+      // Chỉ dịch những dòng chưa hoàn tất
+      if (batchIndices.every(idx => subtitles[idx].status === 'done')) {
+        i += batchSize;
+        continue;
+      }
 
-      // Cập nhật trạng thái đang xử lý cho cụm hiện tại
       setSubtitles(prev => {
         const next = [...prev];
-        batchIndices.forEach(idx => { next[idx].status = 'processing'; });
+        batchIndices.forEach(idx => { if(next[idx].status !== 'done') next[idx].status = 'processing'; });
         return next;
       });
 
@@ -158,55 +146,52 @@ const App: React.FC = () => {
           style, 
           model, 
           "", 
-          fullContentRef.current, 
+          "", 
           autoGlossary
         );
         
-        // Cập nhật kết quả dịch cho cụm
         setSubtitles(prev => {
           const next = [...prev];
           batchIndices.forEach((idx, rIdx) => {
             next[idx] = { 
               ...next[idx], 
-              translatedText: results[rIdx] || "Lỗi tại cụm", 
-              status: results[rIdx] ? 'done' : 'error' 
+              translatedText: results[rIdx], 
+              status: 'done' 
             };
           });
           return next;
         });
         
-        setProgress(Math.round((end / totalLines) * 100));
+        i += batchSize; // Chỉ tiến tới khi cụm này thành công
+        setProgress(Math.round((i / subtitles.length) * 100));
       } catch (err) {
-        log(`Lỗi tại cụm từ dòng ${i + 1}. Đang tự động bỏ qua để tiếp tục...`, 'error');
-        setSubtitles(prev => {
-          const next = [...prev];
-          batchIndices.forEach(idx => { next[idx].status = 'error'; });
-          return next;
-        });
+        log(`Cụm ${i+1} lỗi nghiêm trọng, đang ép buộc thử lại...`, 'error');
+        await new Promise(r => setTimeout(r, 5000)); // Đợi một chút rồi thử lại chính cụm đó
       }
-
-      // Nghỉ ngắn để trình duyệt giải phóng bộ nhớ và cập nhật UI, cho phép dịch vô hạn mà không treo
-      await new Promise(r => setTimeout(r, 150));
+      await new Promise(r => setTimeout(r, 300));
     }
     
     setIsTranslating(false);
-    setProgress(100);
-    log('Dịch hoàn tất!', 'success');
+    if (!isStoppingRef.current) {
+      setProgress(100);
+      log('Hoàn tất 100% tệp tin!', 'success');
+    } else {
+      log('Đã tạm dừng dịch.', 'info');
+    }
   };
 
   return (
     <div className="min-h-screen bg-[#060a13] text-[#94a3b8] p-4 flex flex-col gap-4 font-sans h-screen overflow-hidden">
       
-      {/* Configuration Section */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4 shrink-0">
         <div className="bg-[#0f172a] border border-[#1e293b] rounded-md p-4 shadow-lg">
           <div className="flex items-center gap-2 mb-4 text-[12px] font-bold text-slate-100 uppercase tracking-wider">
-            📥 TẢI TỆP NGUỒN
+            📥 TẢI TỆP NGUỒN (.SRT)
           </div>
           <div className="border-2 border-dashed border-[#1e293b] rounded-md h-24 flex flex-col items-center justify-center relative hover:bg-[#1e293b]/30 transition-all cursor-pointer group">
             <input type="file" ref={fileInputRef} accept=".srt" onChange={handleFileUpload} className="absolute inset-0 opacity-0 cursor-pointer" />
-            <svg className="w-8 h-8 text-slate-600 group-hover:text-blue-400 mb-1" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
-            <span className="text-[10px] text-slate-500 uppercase">Hỗ trợ vô hạn dòng</span>
+            <svg className="w-8 h-8 text-slate-600 group-hover:text-cyan-400 mb-1" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12" /></svg>
+            <span className="text-[10px] text-slate-500 uppercase font-medium">Xử lý 100% file - Không bỏ sót dòng</span>
           </div>
         </div>
 
@@ -229,7 +214,7 @@ const App: React.FC = () => {
               <label className="text-[10px] text-slate-500 font-bold uppercase">Model AI</label>
               <select value={model} onChange={(e) => setModel(e.target.value)} className="w-full bg-[#1e293b] border border-[#334155] rounded px-2 py-1 text-[12px] text-slate-200 outline-none">
                 <option value="gemini-3-flash-preview">Flash (Nhanh & Vô hạn)</option>
-                <option value="gemini-3-pro-preview">Pro (Chuẩn & Sâu)</option>
+                <option value="gemini-3-pro-preview">Pro (Chất lượng cao)</option>
               </select>
             </div>
             <div className="space-y-1">
@@ -246,29 +231,27 @@ const App: React.FC = () => {
             🏷️ THUẬT NGỮ TỰ ĐỘNG
           </div>
           <div className="flex-1 overflow-y-auto custom-scrollbar flex flex-wrap gap-1.5 content-start bg-[#060a13] p-2 rounded border border-[#1e293b]">
-            {isScanning ? <div className="text-[10px] text-cyan-500 animate-pulse font-bold p-2 w-full text-center">Đang học nội dung phim...</div> : 
-              autoGlossary.length === 0 ? <div className="text-[10px] text-slate-700 w-full text-center p-2">Chưa có dữ liệu</div> :
+            {isScanning ? <div className="text-[10px] text-cyan-500 animate-pulse font-bold p-2 w-full text-center">Đang học nội dung...</div> : 
+              autoGlossary.length === 0 ? <div className="text-[10px] text-slate-700 w-full text-center p-2 italic">Tải file để trích xuất</div> :
               autoGlossary.map((term, i) => (
-                <span key={i} className="px-2 py-0.5 bg-[#1e293b] border border-[#334155] rounded text-[10px] text-slate-300">{term}</span>
+                <span key={i} className="px-2 py-0.5 bg-[#1e293b] border border-[#334155] rounded text-[10px] text-slate-300 shadow-sm border-l-2 border-l-cyan-500">{term}</span>
               ))
             }
           </div>
         </div>
       </div>
 
-      {/* Main Panels */}
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-3 gap-4 min-h-0">
-        {/* Preview Panel */}
         <div className="lg:col-span-2 bg-[#0a0f1d] border border-[#1e293b] rounded flex flex-col overflow-hidden shadow-2xl">
           <div className="bg-[#111827] px-4 py-2 border-b border-[#1e293b] flex justify-between items-center">
             <span className="text-[11px] font-bold text-slate-400 uppercase tracking-widest flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.5)]"></span>
+              <span className="w-2 h-2 rounded-full bg-cyan-500 shadow-[0_0_8px_rgba(34,211,238,0.5)]"></span>
               BẢN XEM TRƯỚC
             </span>
             {isTranslating && (
               <div className="flex items-center gap-3">
-                <div className="w-48 bg-slate-800 h-1 rounded-full overflow-hidden">
-                  <div className="bg-cyan-500 h-full transition-all duration-300" style={{width: `${progress}%`}}></div>
+                <div className="w-48 bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                  <div className="bg-cyan-500 h-full transition-all duration-300 shadow-[0_0_10px_#22d3ee]" style={{width: `${progress}%`}}></div>
                 </div>
                 <span className="text-[10px] text-cyan-400 font-mono font-bold">{progress}%</span>
               </div>
@@ -276,26 +259,27 @@ const App: React.FC = () => {
           </div>
           <div className="flex-1 overflow-y-auto custom-scrollbar p-2 space-y-1 bg-[#060a13]">
             {subtitles.length === 0 ? (
-              <div className="h-full flex flex-col items-center justify-center opacity-10">
+              <div className="h-full flex flex-col items-center justify-center opacity-10 select-none">
                 <div className="text-4xl font-black mb-1">GAVIETSUB AI</div>
-                <div className="text-[10px] tracking-[0.4em] font-bold uppercase">Dịch thuật vô hạn dòng v4.0</div>
+                <div className="text-[10px] tracking-[0.4em] font-bold uppercase">Bắt buộc dịch xong 100% nội dung</div>
               </div>
             ) : (
               subtitles.map((sub, idx) => (
                 <div 
                   key={sub.id} 
                   onClick={() => !isTranslating && translateSingleLine(idx)}
-                  className={`flex flex-col p-3 rounded border border-[#1e293b] bg-[#0f172a]/40 hover:bg-[#1e293b]/60 cursor-pointer transition-all ${sub.status === 'error' ? 'border-red-900/50 bg-red-900/10' : sub.status === 'processing' ? 'border-amber-900/30' : ''}`}
+                  className={`flex flex-col p-3 rounded border border-[#1e293b] bg-[#0f172a]/40 hover:bg-[#1e293b]/60 cursor-pointer transition-all ${sub.status === 'processing' ? 'border-amber-900/40 bg-amber-900/5' : sub.status === 'error' ? 'border-red-900/50 bg-red-900/5' : ''}`}
                 >
                   <div className="flex justify-between items-center mb-1">
                     <span className="text-[9px] text-slate-600 font-mono">#{sub.id} | {sub.timeRange}</span>
                     {sub.status === 'processing' && <span className="text-[9px] text-amber-500 animate-pulse font-bold uppercase">Đang dịch...</span>}
-                    {sub.status === 'done' && <span className="text-[8px] text-emerald-500/50 uppercase">Hoàn tất</span>}
+                    {sub.status === 'error' && <span className="text-[9px] text-red-500 font-bold uppercase">Lỗi cụm - Nhấp để dịch lại</span>}
+                    {sub.status === 'done' && <span className="text-[8px] text-cyan-500/50 uppercase font-bold tracking-tighter">Hoàn tất</span>}
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <div className="text-[12px] text-slate-500 leading-relaxed italic">{sub.text}</div>
-                    <div className={`text-[13px] font-bold leading-relaxed ${sub.status === 'done' ? 'text-slate-100' : sub.status === 'error' ? 'text-red-500' : 'text-slate-800'}`}>
-                      {sub.translatedText || (sub.status === 'error' ? 'Lỗi cụm - Nhấp để dịch lại' : '...')}
+                    <div className={`text-[13px] font-bold leading-relaxed ${sub.status === 'done' ? 'text-slate-100' : 'text-slate-800'}`}>
+                      {sub.translatedText || '...'}
                     </div>
                   </div>
                 </div>
@@ -304,33 +288,31 @@ const App: React.FC = () => {
           </div>
         </div>
 
-        {/* System Logs Panel */}
         <div className="bg-[#0a0f1d] border border-[#1e293b] rounded flex flex-col overflow-hidden">
           <div className="bg-[#111827] px-4 py-2 border-b border-[#1e293b] flex items-center gap-2">
             <span className="text-cyan-500 text-sm">🐚</span>
             <span className="text-[11px] font-bold text-slate-400 uppercase tracking-widest">NHẬT KÝ HỆ THỐNG</span>
           </div>
           <div className="flex-1 overflow-y-auto custom-scrollbar p-4 font-mono text-[11px] space-y-2 bg-[#060a13]/80">
-            {logs.length === 0 && <div className="text-slate-700 italic">Hệ thống sẵn sàng...</div>}
+            {logs.length === 0 && <div className="text-slate-700 italic">Hỗ trợ file 10.000 dòng...</div>}
             {logs.map(l => (
-              <div key={l.id} className="flex gap-2 animate-in fade-in slide-in-from-left-2 duration-300">
+              <div key={l.id} className="flex gap-2 animate-in fade-in slide-in-from-left-2">
                 <span className="text-slate-600 shrink-0">[{l.timestamp.toLocaleTimeString([], {hour12:false})}]</span>
-                <span className={l.type === 'error' ? 'text-red-500 font-bold' : l.type === 'success' ? 'text-cyan-400' : 'text-blue-500'}>{l.message}</span>
+                <span className={l.type === 'error' ? 'text-red-500' : l.type === 'success' ? 'text-cyan-400' : 'text-blue-500'}>{l.message}</span>
               </div>
             ))}
           </div>
         </div>
       </div>
 
-      {/* Footer Controls */}
       <footer className="bg-[#0f172a] border border-[#1e293b] rounded-md p-3 flex items-center justify-between shrink-0 shadow-2xl">
         <div className="flex items-center gap-3">
           <button 
             onClick={startTranslation} 
             disabled={isTranslating || subtitles.length === 0} 
-            className="bg-[#10b981] hover:bg-[#059669] text-white px-8 py-2.5 rounded text-[12px] font-bold uppercase transition-all shadow-lg active:scale-95 disabled:opacity-20 flex items-center gap-2"
+            className="bg-[#10b981] hover:bg-[#059669] text-white px-10 py-2.5 rounded text-[12px] font-bold uppercase transition-all shadow-lg active:scale-95 disabled:opacity-20 flex items-center gap-2"
           >
-            <span className="text-sm">▶</span> BẮT ĐẦU DỊCH
+            <span>▶</span> BẮT ĐẦU DỊCH
           </button>
           <button 
             onClick={() => { isStoppingRef.current = true; setIsTranslating(false); }} 
@@ -341,7 +323,7 @@ const App: React.FC = () => {
         </div>
         
         <div className="flex items-center gap-3">
-          <button onClick={resetAll} className="bg-[#1e293b] hover:bg-red-900/10 border border-transparent hover:border-red-900/30 text-slate-400 hover:text-red-400 px-5 py-2.5 rounded text-[11px] font-bold uppercase transition-all flex items-center gap-2">
+          <button onClick={resetAll} className="bg-[#1e293b] hover:bg-red-900/20 text-slate-400 hover:text-red-400 px-5 py-2.5 rounded text-[11px] font-bold uppercase transition-all flex items-center gap-2">
             <span>🗑️</span> XÓA HẾT
           </button>
           <button 
@@ -351,8 +333,8 @@ const App: React.FC = () => {
               const url = URL.createObjectURL(blob);
               const a = document.createElement('a'); a.href = url; a.download = `[GAVIETSUB]_${targetLang}.srt`; a.click();
             }} 
-            disabled={subtitles.filter(s => s.translatedText).length === 0} 
-            className="bg-[#0ea5e9] hover:bg-[#0284c7] text-white px-8 py-2.5 rounded text-[12px] font-bold uppercase shadow-lg transition-all disabled:opacity-20 active:scale-95 flex items-center gap-2"
+            disabled={subtitles.filter(s => s.status === 'done').length === 0} 
+            className="bg-[#0ea5e9] hover:bg-[#0284c7] text-white px-10 py-2.5 rounded text-[12px] font-bold uppercase shadow-lg transition-all disabled:opacity-20 active:scale-95 flex items-center gap-2"
           >
             <span>💾</span> LƯU FILE (.SRT)
           </button>

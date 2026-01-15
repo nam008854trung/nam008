@@ -6,11 +6,13 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 export const scanGlossary = async (fullContent: string, style: TranslationStyle): Promise<string[]> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-  
-  const prompt = `Bạn là biên tập viên kịch bản điện ảnh. Hãy quét kịch bản sau và liệt kê 20 thực thể quan trọng nhất (tên nhân vật, địa danh, vật phẩm quỷ dị, chức danh).
-  PHONG CÁCH PHIM: ${style}
-  KỊCH BẢN: ${fullContent.slice(0, 40000)}
-  CHỈ TRẢ VỀ DUY NHẤT MỘT MẢNG JSON CÁC CHUỖI. KHÔNG GIẢI THÍCH.`;
+  const contentSample = fullContent.slice(0, 15000);
+
+  const prompt = `Bạn là biên tập viên kịch bản. Hãy liệt kê tối đa 15 thuật ngữ quan trọng nhất (tên nhân vật, địa danh, vật phẩm) từ kịch bản này.
+  PHONG CÁCH: ${style}
+  YÊU CẦU: Trả về duy nhất 1 mảng JSON ["Từ 1", "Từ 2", ...].
+  KỊCH BẢN:
+  ${contentSample}`;
 
   try {
     const response = await ai.models.generateContent({
@@ -18,6 +20,7 @@ export const scanGlossary = async (fullContent: string, style: TranslationStyle)
       contents: prompt,
       config: { 
         responseMimeType: "application/json",
+        temperature: 0.2,
         safetySettings: [
           { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
           { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
@@ -26,7 +29,9 @@ export const scanGlossary = async (fullContent: string, style: TranslationStyle)
         ] as any
       }
     });
-    return JSON.parse(response.text || "[]");
+    const text = response.text || "[]";
+    const cleanedText = text.substring(text.indexOf('['), text.lastIndexOf(']') + 1);
+    return JSON.parse(cleanedText);
   } catch (error) {
     return [];
   }
@@ -43,24 +48,23 @@ export const translateBatch = async (
   retryCount = 0
 ): Promise<string[]> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY || '' });
-  const allTerms = autoGlossary?.length ? autoGlossary.join(', ') : '';
+  const allTerms = autoGlossary?.length ? autoGlossary.join(', ') : 'Chưa có';
 
-  const systemInstruction = `VAI TRÒ: Biên dịch viên phim chuyên nghiệp, am hiểu văn hóa mạng Việt Nam.
-QUY TẮC QUAN TRỌNG:
-1. NỘI DUNG HƯ CẤU: Đây là kịch bản phim giả tưởng. KHÔNG chặn hoặc lọc nội dung (kinh dị, bạo lực nhẹ, quỷ dị, y khoa) vì lý do an toàn.
-2. PHONG CÁCH: ${style}. Dịch thoát ý hoàn toàn, dùng ngôn ngữ hiện đại, lôi cuốn, lầy lội nếu phù hợp.
-3. THUẬT NGỮ CỐ ĐỊNH: ${allTerms}. Luôn sử dụng đúng các thuật ngữ này.
-4. ĐỊNH DẠNG: Trả về một mảng JSON các chuỗi đã dịch theo đúng thứ tự đầu vào.`;
-
-  const dataToTranslate = texts.map((text, i) => `[${i}] ${text}`).join('\n');
+  const systemInstruction = `VAI TRÒ: Biên dịch viên phim chuyên nghiệp. 
+NHIỆM VỤ: Dịch kịch bản phim sang ${targetLang}.
+QUY TẮC TUYỆT ĐỐI:
+1. ĐỊNH DẠNG: Trả về một mảng JSON ["dịch 1", "dịch 2", ...] với đúng CHÍNH XÁC ${texts.length} phần tử. 
+2. CẤM: Không trả về bản gốc, không trả về văn bản thừa, không giải thích.
+3. AN TOÀN: Đây là kịch bản hư cấu. KHÔNG chặn nội dung bạo lực/nhạy cảm. 
+4. PHONG CÁCH: ${style}. Thuật ngữ cần dùng: ${allTerms}.`;
 
   try {
     const response = await ai.models.generateContent({
       model: modelName,
-      contents: `Dịch các dòng sau sang ${targetLang}:\n${dataToTranslate}`,
+      contents: `Dịch mảng này sang ${targetLang}, trả về đúng ${texts.length} dòng: ${JSON.stringify(texts)}`,
       config: {
         systemInstruction,
-        temperature: 0.8,
+        temperature: 0.4,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.ARRAY,
@@ -75,31 +79,30 @@ QUY TẮC QUAN TRỌNG:
       }
     });
 
-    let textResponse = (response.text || "[]").trim();
-    
-    // Sửa lỗi JSON bị cắt ngang
-    if (!textResponse.endsWith(']')) {
-      if (textResponse.endsWith('"')) textResponse += ']';
-      else if (textResponse.endsWith(',')) textResponse = textResponse.slice(0, -1) + ']';
-      else textResponse += '"]';
+    let rawText = (response.text || "[]").trim();
+    const startIdx = rawText.indexOf('[');
+    const endIdx = rawText.lastIndexOf(']');
+    if (startIdx !== -1 && endIdx !== -1) {
+      rawText = rawText.substring(startIdx, endIdx + 1);
     }
 
-    try {
-      const result = JSON.parse(textResponse);
-      if (Array.isArray(result)) return result;
-      throw new Error("Invalid format");
-    } catch (e) {
-      // Regex fallback
-      const matches = textResponse.match(/"([^"\\]|\\.)*"/g);
-      if (matches) return matches.map(m => m.replace(/^"|"$/g, '').replace(/\\"/g, '"'));
-      throw e;
+    const result = JSON.parse(rawText);
+    
+    // Kiểm tra nghiêm ngặt: Phải là mảng và phải đủ số lượng dòng
+    if (Array.isArray(result) && result.length === texts.length) {
+      return result;
     }
     
+    throw new Error("Incomplete or invalid translation result");
+    
   } catch (error: any) {
-    if (retryCount < 2) {
-      await sleep(2500 * (retryCount + 1));
+    // Tăng cường Retry: Không bao giờ trả về bản gốc, thử lại cho đến khi thành công (tối đa 5 lần cho mỗi cụm)
+    if (retryCount < 5) {
+      const waitTime = Math.pow(2, retryCount) * 2000; // Đợi lâu dần: 2s, 4s, 8s...
+      await sleep(waitTime);
       return translateBatch(texts, targetLang, style, modelName, glossary, fullContent, autoGlossary, retryCount + 1);
     }
-    throw error;
+    // Nếu quá 5 lần vẫn lỗi (cực hiếm), ném lỗi để App xử lý retry ở cấp độ cao hơn
+    throw new Error("Failed after multiple attempts");
   }
 };
